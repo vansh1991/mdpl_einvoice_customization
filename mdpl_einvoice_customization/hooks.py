@@ -5,6 +5,13 @@ app_description = "MDPL EInvoice Customization"
 app_email = "techdudesoftwarelab@gmail.com"
 app_license = "mit"
 
+
+doc_events = {
+    "Sales Invoice": {
+        "on_submit": "mdpl_einvoice_customization.sales_return_invoice.generate_einvoice_on_sales_return"
+    }
+}
+
 # Apps
 # ------------------
 
