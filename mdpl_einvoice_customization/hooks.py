@@ -8,6 +8,7 @@ app_license = "mit"
 
 doc_events = {
     "Sales Invoice": {
+        "before_submit": "mdpl_einvoice_customization.sales_return_invoice.before_submit_return_invoice",
         "on_submit": "mdpl_einvoice_customization.sales_return_invoice.generate_einvoice_on_sales_return"
     }
 }
