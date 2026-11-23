@@ -223,3 +223,54 @@ def _ctx_to_dict(ctx):
 	if isinstance(ctx, dict):
 		return ctx
 	return frappe.parse_json(ctx) or {}
+
+
+# ---------------------------------------------------------------------------
+# 4. Show the effective GST rate in the taxes table (doc_event: validate)
+# ---------------------------------------------------------------------------
+
+
+def sync_tax_row_rates(doc, method=None):
+	"""
+	Set an "On Net Total" tax row's Rate to the rate actually charged when every
+	item carries the same item-level rate for that account (e.g. all items on
+	GST 0% -> CGST/SGST shown as 0 instead of the template's 9).
+
+	Display-only: a row is changed only when every item overrides its rate via
+	item_tax_rate, so the row rate is not used in any item's tax calculation and
+	tax amounts cannot change. Mixed-rate invoices, and rows any item relies on,
+	are left untouched.
+	"""
+	if not doc.get("items") or not doc.get("taxes"):
+		return
+
+	item_tax_maps = [_parse_item_tax_rate(item.get("item_tax_rate")) for item in doc.items]
+
+	for tax in doc.taxes:
+		if tax.charge_type != "On Net Total" or not tax.account_head:
+			continue
+
+		rates = set()
+		for item_tax_map in item_tax_maps:
+			rate = item_tax_map.get(tax.account_head)
+			if rate is None or isinstance(rate, str):
+				# Item uses the row rate (or tax is marked N/A) -> leave the row alone
+				rates = None
+				break
+			rates.add(flt(rate, tax.precision("rate")))
+
+		if rates and len(rates) == 1:
+			rate = rates.pop()
+			if flt(tax.rate, tax.precision("rate")) != rate:
+				tax.rate = rate
+
+
+def _parse_item_tax_rate(value):
+	if not value:
+		return {}
+	if isinstance(value, dict):
+		return value
+	try:
+		return frappe.parse_json(value) or {}
+	except Exception:
+		return {}
