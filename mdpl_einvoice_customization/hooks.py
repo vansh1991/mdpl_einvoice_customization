@@ -205,11 +205,13 @@ doc_events = {
 # Request Events
 # ----------------
 # before_request = ["mdpl_einvoice_customization.utils.before_request"]
+before_request = ["mdpl_einvoice_customization.gst_zero_rate.apply_patches"]
 # after_request = ["mdpl_einvoice_customization.utils.after_request"]
 
 # Job Events
 # ----------
 # before_job = ["mdpl_einvoice_customization.utils.before_job"]
+before_job = ["mdpl_einvoice_customization.gst_zero_rate.apply_patches"]
 # after_job = ["mdpl_einvoice_customization.utils.after_job"]
 
 # User Data Protection
