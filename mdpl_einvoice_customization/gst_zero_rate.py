@@ -11,21 +11,49 @@ and `before_job` in hooks.py so the override is active in every web request and
 background job (a plain module-level monkey patch is NOT reliable because app
 packages are not imported when hooks are served from cache).
 
-MAINTENANCE: after every india_compliance update, compare the functions below
-with the originals in
+Item Tax Template selection fallback (section 3 below):
+ERPNext only picks an item's tax template when the Item Tax row's Tax Category
+equals the transaction's Tax Category exactly. Item Tax rows here are kept with
+a blank Tax Category, so for customers whose address carries a Tax Category
+(e.g. "In-State") no template was picked and the 0% template was never applied
+(the invoice-level 18% was charged instead, and the template dropdown was
+empty). When nothing matches the transaction's category, the fallback retries
+with a blank category.
+
+MAINTENANCE: after every india_compliance / erpnext update, compare the
+functions below with the originals in
   india_compliance/gst_india/overrides/item_tax_template.py  (validate)
   india_compliance/gst_india/overrides/transaction.py        (validate_item_tax_template)
-and port any upstream changes.
+  erpnext/stock/get_item_details.py                          (_get_item_tax_template)
+and port any upstream changes. If erpnext starts importing
+`_get_item_tax_template` in another module, add it to ERPNEXT_TAX_TEMPLATE_MODULES.
 """
+
+import importlib
 
 import frappe
 from frappe import _, bold
-from frappe.utils import flt
+from frappe.utils import cstr, flt
 
 _PATCH_FLAG = "_mdpl_zero_rate_taxable_patched"
+_FALLBACK_PATCH_FLAG = "_mdpl_item_tax_category_fallback_patched"
+
+# Modules that hold their own reference to erpnext's `_get_item_tax_template`
+# (via `from erpnext.stock.get_item_details import _get_item_tax_template`).
+ERPNEXT_TAX_TEMPLATE_MODULES = (
+	"erpnext.stock.get_item_details",
+	"erpnext.controllers.accounts_controller",
+	"erpnext.controllers.taxes_and_totals",
+	"erpnext.controllers.queries",
+)
 
 
 def apply_patches(*args, **kwargs):
+	_patch_india_compliance_zero_rate()
+	_patch_item_tax_category_fallback()
+
+
+def _patch_india_compliance_zero_rate():
 	try:
 		import india_compliance.gst_india.overrides.item_tax_template as ic_template
 		import india_compliance.gst_india.overrides.transaction as ic_transaction
@@ -136,3 +164,62 @@ def get_zero_rate_taxable_templates(doc):
 			pluck="name",
 		)
 	)
+
+
+# ---------------------------------------------------------------------------
+# 3. Item Tax Template selection: fall back to blank Tax Category
+# ---------------------------------------------------------------------------
+
+_original_get_item_tax_template = None
+
+
+def _patch_item_tax_category_fallback():
+	global _original_get_item_tax_template
+
+	try:
+		import erpnext.stock.get_item_details as get_item_details
+	except ImportError:
+		return
+
+	if getattr(get_item_details, _FALLBACK_PATCH_FLAG, False):
+		return
+
+	_original_get_item_tax_template = get_item_details._get_item_tax_template
+
+	for module_name in ERPNEXT_TAX_TEMPLATE_MODULES:
+		try:
+			module = importlib.import_module(module_name)
+		except ImportError:
+			continue
+		if getattr(module, "_get_item_tax_template", None) is _original_get_item_tax_template:
+			module._get_item_tax_template = get_item_tax_template_with_category_fallback
+
+	setattr(get_item_details, _FALLBACK_PATCH_FLAG, True)
+
+
+def get_item_tax_template_with_category_fallback(ctx, taxes, out=None, for_validate=False):
+	"""
+	Wraps erpnext's `_get_item_tax_template`. If no Item Tax row matches the
+	transaction's Tax Category, retry with a blank Tax Category so that the
+	item's default (category-less) template is used. Behaviour is unchanged
+	whenever a category-specific row matches.
+	"""
+	result = _original_get_item_tax_template(ctx, taxes, out, for_validate)
+	if result:
+		return result
+
+	ctx = _ctx_to_dict(ctx)
+	if not cstr(ctx.get("tax_category")):
+		return result
+
+	fallback_ctx = dict(ctx)
+	fallback_ctx["tax_category"] = ""
+	return _original_get_item_tax_template(fallback_ctx, taxes, out, for_validate)
+
+
+def _ctx_to_dict(ctx):
+	if isinstance(ctx, frappe.model.document.Document):
+		return ctx.as_dict()
+	if isinstance(ctx, dict):
+		return ctx
+	return frappe.parse_json(ctx) or {}
