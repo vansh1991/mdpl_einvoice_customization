@@ -30,6 +30,7 @@ and port any upstream changes. If erpnext starts importing
 """
 
 import importlib
+import threading
 
 import frappe
 from frappe import _, bold
@@ -170,6 +171,15 @@ def get_zero_rate_taxable_templates(doc):
 # 3. Item Tax Template selection: fall back to blank Tax Category
 # ---------------------------------------------------------------------------
 
+# The genuine erpnext function is stored on the erpnext module itself (not only
+# in this module's globals) *before* anything is replaced. Re-running the patch
+# - concurrently from several threads, after a partial failure, or after this
+# module is re-imported - therefore always reuses the real original and can
+# never capture the wrapper as "original" (which caused infinite recursion).
+_ORIGINAL_ATTR = "_mdpl_original_get_item_tax_template"
+_WRAPPER_MARKER = "_mdpl_category_fallback_wrapper"
+_fallback_patch_lock = threading.Lock()
+
 _original_get_item_tax_template = None
 
 
@@ -181,20 +191,49 @@ def _patch_item_tax_category_fallback():
 	except ImportError:
 		return
 
-	if getattr(get_item_details, _FALLBACK_PATCH_FLAG, False):
+	if _original_get_item_tax_template and getattr(get_item_details, _FALLBACK_PATCH_FLAG, False):
 		return
 
-	_original_get_item_tax_template = get_item_details._get_item_tax_template
+	with _fallback_patch_lock:
+		original = getattr(get_item_details, _ORIGINAL_ATTR, None)
+		if original is None:
+			current = get_item_details._get_item_tax_template
+			if getattr(current, _WRAPPER_MARKER, False):
+				# Wrapped by an older copy of this module that did not store the
+				# original; unwrap via that copy's reference.
+				current = current.__globals__.get("_original_get_item_tax_template")
+			if not callable(current) or getattr(current, _WRAPPER_MARKER, False):
+				frappe.log_error(
+					title="MDPL: item tax category fallback not applied",
+					message="Could not locate erpnext's original _get_item_tax_template.",
+				)
+				return
+			original = current
+			setattr(get_item_details, _ORIGINAL_ATTR, original)
 
-	for module_name in ERPNEXT_TAX_TEMPLATE_MODULES:
-		try:
-			module = importlib.import_module(module_name)
-		except ImportError:
-			continue
-		if getattr(module, "_get_item_tax_template", None) is _original_get_item_tax_template:
-			module._get_item_tax_template = get_item_tax_template_with_category_fallback
+		_original_get_item_tax_template = original
 
-	setattr(get_item_details, _FALLBACK_PATCH_FLAG, True)
+		for module_name in ERPNEXT_TAX_TEMPLATE_MODULES:
+			try:
+				module = importlib.import_module(module_name)
+				existing = getattr(module, "_get_item_tax_template", None)
+				if existing is original or getattr(existing, _WRAPPER_MARKER, False):
+					module._get_item_tax_template = get_item_tax_template_with_category_fallback
+			except Exception:
+				frappe.log_error(title=f"MDPL: item tax category fallback patch failed for {module_name}")
+
+		setattr(get_item_details, _FALLBACK_PATCH_FLAG, True)
+
+
+def _get_original_item_tax_template():
+	original = _original_get_item_tax_template
+	if original is None or getattr(original, _WRAPPER_MARKER, False):
+		import erpnext.stock.get_item_details as get_item_details
+
+		original = getattr(get_item_details, _ORIGINAL_ATTR, None)
+	if original is None or getattr(original, _WRAPPER_MARKER, False):
+		frappe.throw(_("Item tax template lookup is misconfigured. Please restart the server."))
+	return original
 
 
 def get_item_tax_template_with_category_fallback(ctx, taxes, out=None, for_validate=False):
@@ -204,7 +243,9 @@ def get_item_tax_template_with_category_fallback(ctx, taxes, out=None, for_valid
 	item's default (category-less) template is used. Behaviour is unchanged
 	whenever a category-specific row matches.
 	"""
-	result = _original_get_item_tax_template(ctx, taxes, out, for_validate)
+	original = _get_original_item_tax_template()
+
+	result = original(ctx, taxes, out, for_validate)
 	if result:
 		return result
 
@@ -214,7 +255,10 @@ def get_item_tax_template_with_category_fallback(ctx, taxes, out=None, for_valid
 
 	fallback_ctx = dict(ctx)
 	fallback_ctx["tax_category"] = ""
-	return _original_get_item_tax_template(fallback_ctx, taxes, out, for_validate)
+	return original(fallback_ctx, taxes, out, for_validate)
+
+
+setattr(get_item_tax_template_with_category_fallback, _WRAPPER_MARKER, True)
 
 
 def _ctx_to_dict(ctx):
